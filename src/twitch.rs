@@ -1,7 +1,7 @@
 use crate::config::Config;
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
 use std::io::Write;
@@ -97,19 +97,24 @@ struct DeviceAuthRequest {
     device_code: String,
     user_code: String,
     verification_uri: String,
+    #[serde(rename = "expires_in")]
     _expires_in: u64,
     interval: u64,
 }
 
-#[derive(Debug, Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    _refresh_token: Option<String>,
-    // expires_in: u64,
-    // scope: Vec<String>,
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct TokenResponse {
+    pub access_token: String,
+    #[serde(rename = "refresh_token")]
+    pub refresh_token: Option<String>,
+    #[serde(rename = "expires_in")]
+    pub expires_in: Option<u64>,
 }
 
-pub async fn authenticate_via_device_flow(client: &Client, config: &Config) -> Result<String> {
+pub async fn authenticate_via_device_flow(
+    client: &Client,
+    config: &Config,
+) -> Result<TokenResponse> {
     let scopes = "user:read:chat user:write:chat"; // Required scopes
 
     // Step 1: Request Device Code
@@ -157,8 +162,8 @@ pub async fn authenticate_via_device_flow(client: &Client, config: &Config) -> R
         if token_resp.status().is_success() {
             let token_data: TokenResponse = token_resp.json().await?;
             // Cache token
-            save_token_cache(&token_data.access_token)?;
-            return Ok(token_data.access_token);
+            save_token_cache(&token_data)?;
+            return Ok(token_data);
         } else {
             let error_text = token_resp.text().await?;
             if error_text.contains("authorization_pending") {
@@ -172,23 +177,55 @@ pub async fn authenticate_via_device_flow(client: &Client, config: &Config) -> R
     }
 }
 
-pub fn save_token_cache(token: &str) -> Result<()> {
-    let json = json!({ "access_token": token });
+pub fn save_token_cache(token: &TokenResponse) -> Result<()> {
+    let json = serde_json::to_string(token)?;
     let mut file = std::fs::File::create(".token_cache.json")?;
-    file.write_all(json.to_string().as_bytes())?;
+    file.write_all(json.as_bytes())?;
     Ok(())
 }
 
-pub fn load_token_cache() -> Result<String> {
+pub fn load_token_cache() -> Result<TokenResponse> {
     if !Path::new(".token_cache.json").exists() {
         bail!("Cache file not found");
     }
     let data = fs::read_to_string(".token_cache.json")?;
-    let json: serde_json::Value = serde_json::from_str(&data)?;
-    let token = json["access_token"]
-        .as_str()
-        .context("No access_token in cache")?;
-    Ok(token.to_string())
+    let token: TokenResponse = serde_json::from_str(&data)?;
+    Ok(token)
+}
+
+pub async fn validate_token(client: &Client, token: &str) -> Result<bool> {
+    let resp = client
+        .get("https://id.twitch.tv/oauth2/validate")
+        .header("Authorization", format!("OAuth {}", token))
+        .send()
+        .await?;
+    Ok(resp.status().is_success())
+}
+
+pub async fn refresh_token(
+    client: &Client,
+    config: &Config,
+    refresh_token: &str,
+) -> Result<TokenResponse> {
+    let params = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", config.client_id.as_str()),
+    ];
+
+    let resp = client
+        .post("https://id.twitch.tv/oauth2/token")
+        .form(&params)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let text = resp.text().await?;
+        bail!("Failed to refresh token: {}", text);
+    }
+
+    let token_data: TokenResponse = resp.json().await?;
+    Ok(token_data)
 }
 
 pub async fn subscribe_to_chat_messages(

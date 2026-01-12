@@ -17,8 +17,8 @@ use choui_the_no_gui_chatbot::{
     config::Config,
     state::{App, AppEvent},
     twitch::{
-        authenticate_via_device_flow, get_user_id, get_user_login, load_token_cache,
-        send_chat_message, subscribe_to_chat_messages,
+        authenticate_via_device_flow, get_user_id, get_user_login, load_token_cache, refresh_token,
+        save_token_cache, send_chat_message, subscribe_to_chat_messages, validate_token,
     },
     ui::ui,
     ws::{connect_eventsub_ws, connect_irc_ws},
@@ -37,12 +37,32 @@ async fn main() -> Result<()> {
 
     // Authenticate (Device Flow or Cache)
     println!("Authenticating...");
-    let token = if let Ok(cached) = load_token_cache() {
-        println!("Using cached User Access Token.");
-        cached
-    } else {
-        println!("No cached token found. Starting Device Authorization Flow...");
-        authenticate_via_device_flow(&client, &config).await?
+    let token = 'auth: {
+        if let Ok(cached) = load_token_cache() {
+            println!("Found cached token. Validating...");
+            if validate_token(&client, &cached.access_token)
+                .await
+                .unwrap_or(false)
+            {
+                println!("Token is valid!");
+                break 'auth cached.access_token;
+            }
+
+            println!("Token expired or invalid.");
+            if let Some(rt) = cached.refresh_token {
+                println!("Attempting refresh...");
+                if let Ok(new_token) = refresh_token(&client, &config, &rt).await {
+                    println!("Refresh successful!");
+                    let _ = save_token_cache(&new_token);
+                    break 'auth new_token.access_token;
+                }
+                println!("Refresh failed.");
+            }
+        }
+
+        println!("Starting Device Authorization Flow...");
+        let token_resp = authenticate_via_device_flow(&client, &config).await?;
+        token_resp.access_token
     };
     config.oauth_token = Some(token);
     println!("Authentication successful!");
