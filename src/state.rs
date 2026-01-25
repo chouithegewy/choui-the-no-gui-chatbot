@@ -1,7 +1,7 @@
 use crate::config::Config;
 use tui_input::Input;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AppEvent {
     ChatMessage { user: String, text: String },
     UserJoined(String),
@@ -334,10 +334,11 @@ pub struct App {
     pub emote_scroll: usize,
     pub emote_area: ratatui::layout::Rect, // Store the actual rendered area
     pub protocol_name: String,
+    pub bot_login: String,
 }
 
 impl App {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, bot_login: String) -> Self {
         Self {
             messages: Vec::new(),
             input: Input::default(),
@@ -348,6 +349,7 @@ impl App {
             emote_scroll: 0,
             emote_area: ratatui::layout::Rect::default(),
             protocol_name: "Unknown".to_string(),
+            bot_login,
         }
     }
 }

@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use tui_input::backend::crossterm::EventHandler;
 
 use choui_the_no_gui_chatbot::{
+    ai::ask_ai,
     config::Config,
     state::{App, AppEvent},
     twitch::{
@@ -24,14 +25,100 @@ use choui_the_no_gui_chatbot::{
     ws::{connect_eventsub_ws, connect_irc_ws},
 };
 
-#[tokio::main]
-async fn main() -> Result<()> {
+mod audio;
+mod gui;
+
+use std::sync::{Arc, Mutex};
+
+fn main() -> Result<()> {
+    // 1. Create Broadcast Channel
+    let (tx, _rx) = tokio::sync::broadcast::channel(100);
+
+    // 2. Spawn Bot Thread
+    let tx_for_bot = tx.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            if let Err(e) = run_bot(tx_for_bot).await {
+                eprintln!("Bot Error: {}", e);
+            }
+        });
+    });
+
+    // 3. Run Iced GUI
+    use iced::window;
+    use iced::Application;
+
+    let settings = iced::Settings {
+        flags: Arc::new(Mutex::new(Some(tx.subscribe()))),
+        window: window::Settings {
+            transparent: true,
+            decorations: false, // Remove title bar for overlay look
+            level: window::Level::AlwaysOnTop,
+            size: iced::Size {
+                width: 400.0,
+                height: 600.0,
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    gui::Overlay::run(settings)?;
+
+    Ok(())
+}
+
+async fn run_bot(broadcast_tx: tokio::sync::broadcast::Sender<AppEvent>) -> Result<()> {
     // env_logger::init(); // Disable logger output to stdout to avoid breaking TUI
     dotenv().ok();
 
     println!("Twitch EventSub Chat Bot (Rust) starting...");
 
     let mut config = Config::from_env()?;
+
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("debug.log")
+    {
+        use std::io::Write;
+        let key_status = if config.gemini_api_key.is_some() {
+            "Present"
+        } else {
+            "MISSING"
+        };
+        writeln!(
+            file,
+            "Startup Config Check: GEMINI_API_KEY is {}",
+            key_status
+        )
+        .unwrap_or(());
+        writeln!(
+            file,
+            "Startup Config Check: GEMINI_MODEL is '{}'",
+            config.gemini_model
+        )
+        .unwrap_or(());
+
+        // Also check raw env var just in case parsing failed silently
+        let raw_env =
+            std::env::var("GEMINI_API_KEY").unwrap_or_else(|_| "Not found in env".to_string());
+        writeln!(
+            file,
+            "Raw Env Check: GEMINI_API_KEY is '{}'",
+            if raw_env.len() > 5 {
+                "Set (masked)"
+            } else {
+                &raw_env
+            }
+        )
+        .unwrap_or(());
+    }
 
     let client = reqwest::Client::new();
 
@@ -103,6 +190,11 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Fetch bot login name
+    println!("Resolving Bot Login...");
+    let bot_login = get_user_login(&client, &config, &config.bot_user_id).await?;
+    println!("Bot Login: {}", bot_login);
+
     println!("Starting UI...");
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
@@ -113,7 +205,7 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(config.clone());
+    let mut app = App::new(config.clone(), bot_login);
 
     // Use automatic detection for font size, but default to Sixel as requested
     let mut picker = ratatui_image::picker::Picker::from_termios()
@@ -208,6 +300,11 @@ async fn main() -> Result<()> {
     // Let's continue with basic TUI setup but without the loader task fully wired yet.
     // I will return to state.rs.
 
+    // --- Broadcast Channel for Overlay ---
+    // --- Broadcast Channel passed in ---
+
+    // Start Web Server -> REMOVED
+
     let (session_id, _ws_handle) =
         connect_eventsub_ws(client.clone(), config.clone(), tx.clone()).await?;
 
@@ -228,6 +325,9 @@ async fn main() -> Result<()> {
 
     // Flag to control redraws
     let mut should_render = true;
+    let mut last_ai_reply = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(10))
+        .unwrap();
 
     loop {
         if should_render {
@@ -237,14 +337,96 @@ async fn main() -> Result<()> {
 
         tokio::select! {
            Some(evt) = rx.recv() => {
+               // Broadcast ALL events to Overlay
+               let _ = broadcast_tx.send(evt.clone());
+
                should_render = true;
                match evt {
                    AppEvent::ChatMessage { user, text } => {
                        app.messages.push(format!("{}: {}", user, text));
+
+                       // TTS: Speak the message (runs in bot thread, always plays)
+                       let tts_msg = format!("{} says: {}", user, text);
+                       std::thread::spawn(move || {
+                           let _ = std::process::Command::new("espeak").arg(&tts_msg).spawn();
+                       });
+
+                       // Ignore own messages for AI response
+                       if user.eq_ignore_ascii_case(&app.bot_login) {
+                           continue;
+                       }
+
+                       let bot_name = app.config.channel_name.as_deref().unwrap_or("unknown");
+
+                       // Logic:
+                       // 1. Incognito (only reply if "hey", "hello", "intro", OR direct mention/!bot)
+                       // 2. Mocking/Antagonistic (handled by AI prompt, but we just trigger)
+                       // 3. Rate Limit (1s)
+
+                       let text_lower = text.to_lowercase();
+                       let is_trigger = text_lower.contains("hey") ||
+                                        text_lower.contains("hello") ||
+                                        text_lower.contains("hi ") || // "hi " to avoid matching "this"
+                                        text_lower.contains("intro") ||
+                                        text.ends_with("?") ||
+                                        text_lower.starts_with("!bot");
+
+                        if is_trigger {
+                            // Check Rate Limit
+                            if last_ai_reply.elapsed() >= std::time::Duration::from_secs(1) {
+                                last_ai_reply = std::time::Instant::now();
+
+                                let prompt = if text_lower.starts_with("!bot") {
+                                    text.trim_start_matches("!bot ").trim()
+                                } else {
+                                    text.trim()
+                                };
+
+                                if !prompt.is_empty() {
+                                    let config_clone = app.config.clone();
+                                    // Format prompt with username for context
+                                    let user_clone = user.clone();
+                                    let prompt_string = format!("User {}: {}", user_clone, prompt);
+
+                                    tokio::spawn(async move {
+                                        match ask_ai(&prompt_string, &config_clone).await {
+                                            Ok(reply) => {
+                                                let full_reply = format!("@{} {}", user_clone, reply);
+                                                if let Err(e) = send_chat_message(&full_reply, &config_clone).await {
+                                                     // log
+                                                }
+                                            }
+                                            Err(_) => {}
+                                        }
+                                    });
+                                }
+                            }
+                        }
                    }
                     AppEvent::UserJoined(user) => {
                         app.messages.push(format!("-> {} joined", user));
-                        print!("\x07"); // Terminal Bell
+                        audio::play_sound("assets/sounds/join.mp3".to_string());
+
+                        // TTS: Announce the join (runs in bot thread, always plays)
+                        let join_msg = format!("{} has joined the chat!", user);
+                        std::thread::spawn(move || {
+                            let _ = std::process::Command::new("espeak").arg(&join_msg).spawn();
+                        });
+                        // Generate AI Greeting
+                        let config_clone = app.config.clone();
+                        let user_clone = user.clone();
+                        tokio::spawn(async move {
+                            let prompt = format!("User {} just joined. Welcome them excitedly with a single short sentence. Do not ask any questions.", user_clone);
+                             match ask_ai(&prompt, &config_clone).await {
+                                Ok(reply) => {
+                                    let full_reply = format!("@{} {}", user_clone, reply);
+                                    if let Err(_e) = send_chat_message(&full_reply, &config_clone).await {
+                                         // log
+                                    }
+                                }
+                                Err(_) => {}
+                            }
+                        });
                     }
                     AppEvent::UserLeft(user) => {
                         app.messages.push(format!("<- {} left", user));
@@ -274,6 +456,10 @@ async fn main() -> Result<()> {
                            match key.code {
                                KeyCode::Esc => {
                                    app.exit = true;
+                               }
+                               KeyCode::F(1) => {
+                                   let _ = tx.send(AppEvent::UserJoined("TestUser".to_string()));
+                                   app.messages.push("Debug: Simulated User Join".to_string());
                                }
                                KeyCode::Char('c') | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                    app.exit = true;

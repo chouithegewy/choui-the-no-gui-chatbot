@@ -32,7 +32,6 @@ struct ChatMessageContent {
 }
 #[derive(Debug, Deserialize)]
 struct ChatMessageEvent {
-    _broadcaster_user_login: String,
     chatter_user_login: String,
     message: ChatMessageContent,
 }
@@ -60,6 +59,15 @@ pub async fn connect_eventsub_ws(
                     // Clean up debug print:
                     // println!("WS: Got text message: {}", text);
 
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("debug.log")
+                    {
+                        use std::io::Write;
+                        writeln!(file, "WS Received: {}", text).unwrap_or(());
+                    }
+
                     let envelope: Envelope = match serde_json::from_str(&text) {
                         Ok(v) => v,
                         Err(e) => {
@@ -83,13 +91,28 @@ pub async fn connect_eventsub_ws(
                         }
                         "notification" => {
                             if let Some(event) = envelope.payload.get("event") {
-                                if let Ok(chat) =
-                                    serde_json::from_value::<ChatMessageEvent>(event.clone())
-                                {
-                                    let _ = event_tx.send(AppEvent::ChatMessage {
-                                        user: chat.chatter_user_login,
-                                        text: chat.message.text,
-                                    });
+                                match serde_json::from_value::<ChatMessageEvent>(event.clone()) {
+                                    Ok(chat) => {
+                                        let _ = event_tx.send(AppEvent::ChatMessage {
+                                            user: chat.chatter_user_login,
+                                            text: chat.message.text,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        if let Ok(mut file) = std::fs::OpenOptions::new()
+                                            .create(true)
+                                            .append(true)
+                                            .open("debug.log")
+                                        {
+                                            use std::io::Write;
+                                            writeln!(
+                                                file,
+                                                "Failed to parse ChatMessageEvent: {} \nJSON: {}",
+                                                e, event
+                                            )
+                                            .unwrap_or(());
+                                        }
+                                    }
                                 }
                             }
                         }
